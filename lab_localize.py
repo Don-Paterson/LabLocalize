@@ -365,19 +365,22 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
         ("set user admin shell /etc/cli.sh", ">", 8),
         ("save config",                     ">", 8),
     ]
-    # R81.20 reboot prompts differ by host role – same (Y/N)[N] suffix,
-    # different leading text and different correct answer:
+    # R81.20 reboot prompts – both variants share the "(Y/N)[N]" suffix:
     #
-    #   A-SMS / A-GW  : "Are you sure you want to reboot?(Y/N)[N]"  → answer Y
-    #   A-EPM         : "Do you want to save it now?(Y/N)[N]"        → answer N
-    #                   (config already saved; EPM is out of scope here but
-    #                    the logic handles it defensively)
+    #   Normal (clean config):
+    #     "Are you sure you want to reboot?(Y/N)[N]"   → answer Y
+    #     This is the expected prompt when the script runs at lab start.
     #
-    # Strategy: wait for (Y/N)[N], then inspect the full prompt text to pick
-    # the correct response.  Both prompt variants share this suffix.
+    #   Dirty config (unsaved changes exist at reboot time):
+    #     "Do you want to save it now?(Y/N)[N]"         → answer N
+    #     The save config calls above should prevent this, but if something
+    #     left the DB dirty this handles it gracefully without hanging.
+    #
+    # Strategy: wait for the shared (Y/N)[N] suffix, then read the full
+    # buffer to decide which prompt arrived and send the correct answer.
     REBOOT_PROMPT_SUFFIX  = "(Y/N)[N]"
-    REBOOT_CONFIRM_NEEDLE = "sure you want to reboot"   # A-SMS / A-GW
-    REBOOT_SAVE_NEEDLE    = "save it now"               # A-EPM (defensive)
+    REBOOT_CONFIRM_NEEDLE = "sure you want to reboot"   # normal / clean state
+    REBOOT_SAVE_NEEDLE    = "save it now"               # dirty config fallback
 
     if dry_run:
         all_cmds = (
@@ -442,10 +445,9 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
                         f"Timed out waiting for '{expect}' after: {cmd!r}\nGot: {out!r}")
 
         # ── reboot ────────────────────────────────────────────────────────────
-        # R81.20 shows a (Y/N)[N] prompt before rebooting.  The prompt text
-        # varies by host role so we read it before deciding what to send:
-        #   "Are you sure you want to reboot?(Y/N)[N]"  → Y  (A-SMS, A-GW)
-        #   "Do you want to save it now?(Y/N)[N]"        → N  (A-EPM, defensive)
+        # Wait for the (Y/N)[N] prompt, then check which variant arrived:
+        #   "Are you sure you want to reboot?(Y/N)[N]"  → Y  (normal / expected)
+        #   "Do you want to save it now?(Y/N)[N]"        → N  (dirty config guard)
         # If the prompt never arrives the host likely started rebooting anyway.
         chan.send("reboot\n")
         out = _recv_until(chan, REBOOT_PROMPT_SUFFIX, timeout=15)
