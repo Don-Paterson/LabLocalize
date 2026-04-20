@@ -343,7 +343,7 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
         clish: save config
         clish: set user admin shell /etc/cli.sh
         clish: save config
-        clish: reboot  → answer N to "save now?" prompt (already saved above)
+        clish: reboot  → Y to "Are you sure you want to reboot?(Y/N)[N]"
     """
     name = host["name"]
     ip   = host["ip"]
@@ -365,13 +365,19 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
         ("set user admin shell /etc/cli.sh", ">", 8),
         ("save config",                     ">", 8),
     ]
-    # R81.20 reboot sequence:
-    #   send "reboot"
-    #   → Gaia prompts: "Do you want to save it now?(Y/N)[N]"
-    #   → send "N"  (config already saved by save config above)
-    #   → host reboots; SSH connection drops naturally
-    # The prompt substring "(Y/N)[N]" is distinctive enough to match reliably.
-    REBOOT_SAVE_PROMPT = "(Y/N)[N]"
+    # R81.20 reboot prompts differ by host role – same (Y/N)[N] suffix,
+    # different leading text and different correct answer:
+    #
+    #   A-SMS / A-GW  : "Are you sure you want to reboot?(Y/N)[N]"  → answer Y
+    #   A-EPM         : "Do you want to save it now?(Y/N)[N]"        → answer N
+    #                   (config already saved; EPM is out of scope here but
+    #                    the logic handles it defensively)
+    #
+    # Strategy: wait for (Y/N)[N], then inspect the full prompt text to pick
+    # the correct response.  Both prompt variants share this suffix.
+    REBOOT_PROMPT_SUFFIX  = "(Y/N)[N]"
+    REBOOT_CONFIRM_NEEDLE = "sure you want to reboot"   # A-SMS / A-GW
+    REBOOT_SAVE_NEEDLE    = "save it now"               # A-EPM (defensive)
 
     if dry_run:
         all_cmds = (
@@ -379,7 +385,7 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
             + [GAIA_EXPERT_PASS]
             + [c[0] for c in commands_expert]
             + [c[0] for c in commands_clish_post]
-            + ["reboot", "N  (answer to: Do you want to save it now?(Y/N)[N])"]
+            + ["reboot", "Y  (answer to: Are you sure you want to reboot?(Y/N)[N])"]
         )
         detail = f"Would send to {ip}:\n" + "\n".join(f"    {c}" for c in all_cmds)
         return (name, True, detail)
@@ -436,18 +442,18 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
                         f"Timed out waiting for '{expect}' after: {cmd!r}\nGot: {out!r}")
 
         # ── reboot ────────────────────────────────────────────────────────────
-        # Send reboot and wait for the R81.20 "save?" prompt.
-        # Config is already saved above, so answer N.
-        # The connection will drop as the host reboots – that is expected
-        # and not treated as an error.
+        # R81.20 shows a (Y/N)[N] prompt before rebooting.  The prompt text
+        # varies by host role so we read it before deciding what to send:
+        #   "Are you sure you want to reboot?(Y/N)[N]"  → Y  (A-SMS, A-GW)
+        #   "Do you want to save it now?(Y/N)[N]"        → N  (A-EPM, defensive)
+        # If the prompt never arrives the host likely started rebooting anyway.
         chan.send("reboot\n")
-        out = _recv_until(chan, REBOOT_SAVE_PROMPT, timeout=15)
-        if REBOOT_SAVE_PROMPT in out:
-            chan.send("N\n")
-        else:
-            # Prompt not seen – host may have started rebooting anyway,
-            # or the prompt text differs on this build.  Log and continue.
-            pass
+        out = _recv_until(chan, REBOOT_PROMPT_SUFFIX, timeout=15)
+        if REBOOT_PROMPT_SUFFIX in out:
+            if REBOOT_CONFIRM_NEEDLE in out:
+                chan.send("Y\n")   # "Are you sure you want to reboot?"
+            else:
+                chan.send("N\n")   # "Do you want to save it now?" – already saved
         # Give the host a moment to start the reboot before we close.
         time.sleep(3)
 
