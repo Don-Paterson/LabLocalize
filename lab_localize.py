@@ -250,10 +250,22 @@ Write-Host "  [Windows] Setting UI language override: $lang"
 Set-WinUILanguageOverride -Language $lang
 
 Write-Host "  [Windows] Setting user language list + input method"
-$list = New-WinUserLanguageList $lang
-$list[0].InputMethodTips.Clear()
-$list[0].InputMethodTips.Add($tip)
-Set-WinUserLanguageList $list -Force
+# New-WinUserLanguageList throws a COM marshal error when called from a
+# subprocess PS session on Windows 10 22H2.  Use a try/catch: attempt the
+# full list-object method first (preserves InputMethodTip), fall back to the
+# simple string form if it fails (sets language without specific IME tip,
+# which is acceptable for lab use).
+try {{
+    $list = New-WinUserLanguageList $lang
+    $list[0].InputMethodTips.Clear()
+    $list[0].InputMethodTips.Add($tip)
+    Set-WinUserLanguageList $list -Force
+    Write-Host "  [Windows] Language list set with input method tip"
+}} catch {{
+    Write-Host "  [Windows] Falling back to simple language list (COM marshal issue): $($_.Exception.Message)"
+    Set-WinUserLanguageList -LanguageList $lang -Force
+    Write-Host "  [Windows] Language list set (without specific input method tip)"
+}}
 
 # Set-SystemPreferredUILanguage requires the language pack to be installed.
 # Skip gracefully if it is missing rather than failing the whole script.
@@ -351,9 +363,14 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
     commands_clish = [
         ("lock database override",                               ">", 8),
         (f"set timezone {loc.gaia_continent} / {loc.gaia_city}", ">", 8),
-        ("expert",                                               "assword:", 8),
     ]
-    commands_expert_auth = (GAIA_EXPERT_PASS, "#", 8)
+    # expert is handled separately – see the SSH session block below.
+    # Keeping it out of the loop avoids a race where Gaia's "Enter expert
+    # mode password:" prompt arrives after _recv_until has already returned
+    # on the prior ">", leaving the buffer empty for the password wait.
+    EXPERT_PROMPT   = "assword:"   # "Enter expert mode password:"
+    EXPERT_SHELL    = "#"
+    commands_expert_auth = (GAIA_EXPERT_PASS, "#", 10)
     commands_expert = [
         (f"dbset keyboard:mapping {loc.gaia_kb}", "#", 6),
         ("dbset save",                            "#", 6),
@@ -422,6 +439,15 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
                         f"Timed out waiting for '{expect}' after: {cmd!r}\nGot: {out!r}")
 
         # ── enter expert mode ─────────────────────────────────────────────────
+        # Small pause after the last clish command so any trailing output from
+        # `set timezone` is fully flushed before we send `expert`.
+        time.sleep(0.5)
+        chan.send("expert\n")
+        out = _recv_until(chan, EXPERT_PROMPT, timeout=10)
+        if EXPERT_PROMPT not in out:
+            return (name, False,
+                    f"Timed out waiting for expert password prompt\nGot: {out!r}")
+        # Send the expert password and wait for the # shell prompt.
         chan.send(commands_expert_auth[0] + "\n")
         out = _recv_until(chan, commands_expert_auth[1], timeout=commands_expert_auth[2])
         if commands_expert_auth[1] not in out:
