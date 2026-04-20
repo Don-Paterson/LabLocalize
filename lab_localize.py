@@ -343,7 +343,7 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
         clish: save config
         clish: set user admin shell /etc/cli.sh
         clish: save config
-        clish: reboot  → confirm y
+        clish: reboot  → answer N to "save now?" prompt (already saved above)
     """
     name = host["name"]
     ip   = host["ip"]
@@ -365,7 +365,13 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
         ("set user admin shell /etc/cli.sh", ">", 8),
         ("save config",                     ">", 8),
     ]
-    reboot_cmd = ("reboot", "y/n", 10)
+    # R81.20 reboot sequence:
+    #   send "reboot"
+    #   → Gaia prompts: "Do you want to save it now?(Y/N)[N]"
+    #   → send "N"  (config already saved by save config above)
+    #   → host reboots; SSH connection drops naturally
+    # The prompt substring "(Y/N)[N]" is distinctive enough to match reliably.
+    REBOOT_SAVE_PROMPT = "(Y/N)[N]"
 
     if dry_run:
         all_cmds = (
@@ -373,7 +379,7 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
             + [GAIA_EXPERT_PASS]
             + [c[0] for c in commands_expert]
             + [c[0] for c in commands_clish_post]
-            + ["reboot", "y"]
+            + ["reboot", "N  (answer to: Do you want to save it now?(Y/N)[N])"]
         )
         detail = f"Would send to {ip}:\n" + "\n".join(f"    {c}" for c in all_cmds)
         return (name, True, detail)
@@ -430,12 +436,20 @@ def configure_gaia_host(host: dict, loc: Locale, dry_run: bool) -> tuple[str, bo
                         f"Timed out waiting for '{expect}' after: {cmd!r}\nGot: {out!r}")
 
         # ── reboot ────────────────────────────────────────────────────────────
-        chan.send(reboot_cmd[0] + "\n")
-        out = _recv_until(chan, reboot_cmd[1], timeout=reboot_cmd[2])
-        if reboot_cmd[1].lower() in out.lower():
-            chan.send("y\n")
-        # Connection will drop as the host reboots – that's expected.
-        time.sleep(2)
+        # Send reboot and wait for the R81.20 "save?" prompt.
+        # Config is already saved above, so answer N.
+        # The connection will drop as the host reboots – that is expected
+        # and not treated as an error.
+        chan.send("reboot\n")
+        out = _recv_until(chan, REBOOT_SAVE_PROMPT, timeout=15)
+        if REBOOT_SAVE_PROMPT in out:
+            chan.send("N\n")
+        else:
+            # Prompt not seen – host may have started rebooting anyway,
+            # or the prompt text differs on this build.  Log and continue.
+            pass
+        # Give the host a moment to start the reboot before we close.
+        time.sleep(3)
 
         return (name, True, f"Configured {loc.gaia_continent}/{loc.gaia_city}, kb={loc.gaia_kb}. Rebooting.")
 
